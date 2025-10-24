@@ -257,15 +257,17 @@ end
 values[!,:pnl] = pnl
 values[!,:simulatedValue] = simulatedValue
 
-risk = select(aggRisk(values,[:Stock]),[:Stock, :VaR95, :ES95])
-# 4×3 DataFrame
-#  Row │ Stock   VaR95    ES95    
-#      │ String  Float64  Float64
-# ─────┼──────────────────────────
-#    1 │ x1      222.714  321.864
-#    2 │ x2      133.956  183.998
-#    3 │ x3      235.331  298.907
-#    4 │ Total   477.606  632.105
+risk = select(aggRisk(values,[:Stock]),[:Stock, :VaR95, :ES95, :VaR95_Pct, :ES95_Pct])
+
+# PCT Values for reference.  Asked for $ values.
+# 4×5 DataFrame
+#  Row │ Stock   VaR95    ES95     VaR95_Pct  ES95_Pct  
+#      │ String  Float64  Float64  Float64    Float64
+# ─────┼────────────────────────────────────────────────
+#    1 │ x1      222.714  321.864  0.0268126  0.0387493
+#    2 │ x2      133.956  183.998  0.0173059  0.0237709
+#    3 │ x3      235.331  298.907  0.0286443  0.0363828
+#    4 │ Total   477.606  632.105  0.019685   0.0260529
 
 # do it 1000 times to get a CI 
 vars = Array{Float64,2}(undef,(1000,4))
