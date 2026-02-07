@@ -1,0 +1,10 @@
+import pandas as pd
+import numpy as np
+file_path = r"C:\Users\RAYNSN\Desktop\QRM\FinTech-545-Fall2025\testfiles\data\test1.csv"
+df = pd.read_csv(file_path)
+print(df.head())
+df_clean = df.dropna()
+cov_matrix = df_clean.cov()
+print(cov_matrix)
+output_path = r"C:\Users\RAYNSN\Desktop\QRM\FinTech-545-Fall2025\Assignment Answers by Ruiwen HE\W3\testout_1.1.csv"
+cov_matrix.to_csv(output_path)
