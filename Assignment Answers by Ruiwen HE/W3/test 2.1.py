@@ -22,3 +22,5 @@ cov_matrix = (X_centered.T * weights) @ X_centered
 df_cov = pd.DataFrame(cov_matrix, index=df_clean.columns, columns=df_clean.columns)
 print(df_cov)
 df_cov.to_csv(output_path)
+
+
