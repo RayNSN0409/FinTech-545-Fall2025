@@ -643,11 +643,470 @@ cov_input = psd_cov_matrix_Higham.values
 B_matrix = get_pca_simulation_matrix(cov_input, explained_variance_threshold=1.0)
 
 print("=== PCA 生成的 B 矩阵 ===")
-print(pd.DataFrame(B_matrix).iloc[:3, :3]) # 预览
 print(pd.DataFrame(B_matrix))  # 查看全部
 
 
-    
+
+### 蒙特卡洛模拟法的 VaR (Monte Carlo VaR)，这里我们使用 Cholesky 分解得到 L 矩阵，生成标准正态随机数矩阵 Z，然后通过 Y = L @ Z 生成相关的随机收益率，最后根据置信水平计算 VaR 金额
+import numpy as np
+
+# ==========================================
+# 0. 参数设置 (Configuration)
+# ==========================================
+# 假设 psd_cov_matrix_Higham 是你之前修复好的协方差矩阵 (3x3)
+# 这里的 L 是下三角矩阵 (Lower Triangular Matrix)
+L = np.linalg.cholesky(psd_cov_matrix_Higham)
+
+# 资产权重: 3个资产，各占 1/3
+weights = np.array([1/3, 1/3, 1/3])  # Shape: (3,)
+
+# 组合总价值
+PV = 1_000_000
+
+# 模拟次数 (Monte Carlo Simulations)
+# 10万次能保证结果在小数点后2位稳定
+n_sims = 100_000
+
+# 置信度 (95%)
+alpha = 0.05
+
+# 均值假设 (Drift Assumption)
+# 这里设为 0 (3个资产的均值都是0)
+# Shape: (3,) -> [0., 0., 0.]
+mu = np.zeros(len(weights)) 
+
+# ==========================================
+# 1. 蒙特卡洛引擎 (MC Engine)
+# ==========================================
+
+# Step A: 生成纯净噪音 (Uncorrelated Standard Normals)
+# 形状: (3, 100000) -> 3行代表资产，10万列代表模拟的天数
+# 这一步对应公式中的 Z
+Z = np.random.normal(0, 1, size=(len(weights), n_sims))
+
+# Step B: 注入相关性 (Impose Correlation)
+# 公式: R_sim = L @ Z
+# (3,3) @ (3,100000) -> (3, 100000)
+correlated_returns = L @ Z
+
+# Step C: 加上均值 (Add Drift) -> 这里的广播机制
+# mu 的原始形状是 (3,)。
+# mu.reshape(-1, 1) 把它变成了 (3, 1)。
+# NumPy 会自动把这 1 列复制 10万次，加到 correlated_returns 的每一列上。
+# 虽然这里全是 0，不加也行，但为了代码的通用性，保留它是专业做法。
+simulated_asset_returns = correlated_returns + mu.reshape(-1, 1)
+
+# ==========================================
+# 2. 计算组合盈亏 (Portfolio P&L)
+# ==========================================
+
+# Step D: 计算组合层面的收益率
+# 也就是把 3 个资产的收益率加权求和
+# weights (3,) @ simulated_asset_returns (3, 100000)
+# 结果 sim_port_returns 形状是 (100000,) -> 代表组合在10万种情况下的收益率
+sim_port_returns = weights @ simulated_asset_returns
+
+# Step E: 转化为金额盈亏
+# 这一步得到 10万个可能的盈亏金额
+sim_port_pnl = PV * sim_port_returns
+
+# ==========================================
+# 3. 计算 VaR (Calculate VaR)
+# ==========================================
+
+# Step F: 排序并取分位数
+# np.percentile(x, 5) 会找从小到大排在第 5% 位置的数
+# 因为 VaR 通常表示为正数（亏损金额），所以我们要加负号
+VaR_MC_percent = -np.percentile(sim_port_returns, alpha * 100)
+VaR_MC_dollar = -np.percentile(sim_port_pnl, alpha * 100)
+
+# ==========================================
+# 4. 结果输出 (Output)
+# ==========================================
+print(f"--- Monte Carlo Simulation Results ---")
+print(f"Simulations: {n_sims:,}")
+print(f"Confidence : {1 - alpha:.0%}")
+print(f"Mean Drift : 0 (Assumed)")
+print("-" * 30)
+print(f"MC VaR (95%) : ${VaR_MC_dollar:,.2f}")
+print(f"MC VaR (%)   : {VaR_MC_percent:.4%}")
+
+
+
+### T分布蒙特卡洛模拟法的 VaR (Monte Carlo VaR with T-distribution),这里我们使用拟合的 T分布参数生成随机数矩阵 Z，然后通过 Y = L @ Z 生成相关的随机收益率，最后根据置信水平计算 VaR 金额
+import numpy as np
+
+# ==========================================
+# 0. 参数准备
+# ==========================================
+# 假设 nu 是你之前用 stats.t.fit 拟合出来的自由度
+# 如果 nu > 30，结果基本等于正态分布；如果 nu < 5，肥尾极其显著
+nu = 5.0  # 举例：设为一个较小的数来演示肥尾效果
+
+# 其他参数保持不变
+L = np.linalg.cholesky(psd_cov_matrix_Higham) 
+weights = np.array([1/3, 1/3, 1/3])
+PV = 1_000_000
+n_sims = 100_000
+alpha = 0.05
+mu = np.zeros(len(weights))
+
+# ==========================================
+# 1. 蒙特卡洛引擎 (T-Distribution Version)
+# ==========================================
+
+# [修改点 1] 生成原始的 t-分布随机数 (Raw t-noise)
+# 使用 nu 作为自由度参数
+# 此时 Z_t_raw 的方差不是 1，而是 nu/(nu-2)
+Z_t_raw = np.random.standard_t(df=nu, size=(len(weights), n_sims))
+
+# [修改点 2] 方差调整 (Variance Adjustment)
+# 这一步至关重要！我们要把 t-分布的方差强行压缩回 1
+# 这样协方差矩阵 L 才能正确发挥作用
+if nu > 2:
+    scale_factor = np.sqrt((nu - 2) / nu)
+else:
+    scale_factor = 1 # 理论上 nu<=2 方差不存在，但在工程上设为1防止报错
+
+# 得到标准化的 t-分布噪音 (方差=1，但保留了肥尾形状)
+Z_t = Z_t_raw * scale_factor
+
+# [后续步骤完全不变] 注入相关性
+# R = L @ Z
+correlated_returns = L @ Z_t
+
+# 加上均值 (广播)
+simulated_asset_returns = correlated_returns + mu.reshape(-1, 1)
+
+# ==========================================
+# 2. 计算组合盈亏
+# ==========================================
+# 加权求和
+sim_port_returns = weights @ simulated_asset_returns
+# 算金额
+sim_port_pnl = PV * sim_port_returns
+
+# ==========================================
+# 3. 计算 VaR
+# ==========================================
+VaR_t_MC_percent = -np.percentile(sim_port_returns, alpha * 100)
+VaR_t_MC_dollar = -np.percentile(sim_port_pnl, alpha * 100)
+
+print(f"--- T-Student Monte Carlo Results (nu={nu}) ---")
+print(f"MC VaR (95%) : ${VaR_t_MC_dollar:,.2f}")
+print(f"MC VaR (%)   : {VaR_t_MC_percent:.4%}")
+
+
+
+
+### 计算参数法的 VaR (parametric VaR / Delta Normal VaR),这里我们假设收益率服从正态分布，使用协方差矩阵计算组合波动率，再根据置信水平查 Z 分数，最后计算 VaR 金额
+import numpy as np
+import pandas as pd
+from scipy.stats import norm
+
+# ==========================================
+# 第一步：准备输入参数 (Setup)
+# ==========================================
+# 1. 投资组合总市值 (Portfolio Value)
+PV = 1_000_000  
+
+# 2. 定义持有权重 (Weights) -> 对应公式里的 Gradient (∇R)
+# 如果全是股票，∇R 就是资金权重。这里假设等权重持有。
+# 注意：一定要用 numpy array，方便做矩阵运算
+weights = np.array([1/4, 1/4, 1/4, 1/4])  # 4 个资产，每个占 25%
+
+# 3. 设置置信水平 (Confidence Level)
+alpha = 0.05  # 95% VaR
+
+# ==========================================
+# 第二步：计算核心统计量 (The "Sandwich")
+# ==========================================
+# 1. 计算协方差矩阵 (Sigma)
+# 对应公式中的 Σ
+file_path = r"C:\Users\RAYNSN\Desktop\QRM\FinTech-545-Fall2025\testfiles\data\test7_3.csv"
+df_clean = pd.read_csv(file_path).dropna()  # 确保没有缺失值
+cov_matrix = df_clean.cov()
+
+# 2. 计算组合方差和波动率
+# 核心公式: σ² = w.T * Σ * w (三明治公式)
+# 在 Python 里，@ 符号表示矩阵乘法
+port_var = weights.T @ cov_matrix @ weights
+port_std = np.sqrt(port_var)
+
+# ==========================================
+# 第三步：计算 VaR
+# ==========================================
+# 1. 查表找 Z 分数 (Inverse CDF)
+# 对于 5%，norm.ppf(0.05) ≈ -1.645
+z_score = norm.ppf(alpha)
+
+# 2. 计算最终 VaR (金额)
+# 公式: VaR = - PV * Z * σ
+VaR_1day = - PV * z_score * port_std
+
+print(f"---------------正态分布参数法 VaR 计算结果--------")
+print(f"95% 1-Day VaR: ${VaR_1day:,.2f}")
+
+
+### 计算参数法的 VaR进阶版，这里我们假设收益率服从 T分布，使用拟合的 T分布参数计算组合波动率，再根据置信水平查 T 分数，最后计算 VaR 金额
+import numpy as np
+import pandas as pd
+from scipy import stats
+
+# ==========================================
+# 0. 数据准备与预处理 (Data Setup)
+# ==========================================
+# 假设 df_clean 是你的资产收益率矩阵 (行=日期, 列=资产)
+# 假设 weights 是资产权重向量 (shape: N,)
+# PV 是投资组合当前总价值
+# alpha 是置信水平 (e.g., 0.05 for 95% VaR)
+
+# -----------------------------------------------------------------
+# [核心步骤 A] 计算协方差矩阵 (Covariance Matrix)
+# -----------------------------------------------------------------
+# 陷阱提示 (Pitfall Alert):
+# 如果你的数据有缺失值 (NaN)，直接用 df_clean.cov() 默认是 'pairwise' (成对删除)。
+# 这会导致计算出的协方差矩阵可能 "非半正定" (Non-PSD)。
+# 表现为: 算出的组合方差是负数，程序报错。
+
+# 推荐做法 1: 严格清洗 (Drop Missing) - 最安全，但丢数据
+cov_matrix = df_clean.dropna().cov()
+
+# 推荐做法 2: 指数加权 (EWMA) - 业界标准 (RiskMetrics)，且天然PSD
+# cov_matrix = df_clean.ewm(span=30).cov().iloc[-1] 
+
+# 不推荐做法: 直接 df.cov() (Pairwise) 除非你后续做了 Higham Fix 修正
+
+# -----------------------------------------------------------------
+# [核心步骤 B] 计算组合波动率 (Portfolio Volatility - Sigma_p)
+# -----------------------------------------------------------------
+# 使用 "三明治公式" (Quadratic Form): w.T * Sigma * w
+port_var = weights.T @ cov_matrix @ weights
+
+# 检查非正定性 (Sanity Check for PSD)
+if port_var < 0:
+    raise ValueError("Error: 协方差矩阵非正定，导致方差为负。请检查数据清洗方式(比如用了Pairwise?)或使用 Higham Fix。")
+
+port_std = np.sqrt(port_var)
+print(f"\n组合正态波动率 (Sigma_p): {port_std:.4%}")
+
+
+# ==========================================
+# 1. 拟合 t-分布 (Fit t-distribution)
+# ==========================================
+
+# -----------------------------------------------------------------
+# [关键动作] 先捏合成一个整体 (Aggregate First)
+# -----------------------------------------------------------------
+# 为什么？因为我们很难直接拟合多元 t-分布 (Multivariate t)。
+# 我们利用线性性质，先算出 "如果持有这个权重，历史上的每天表现如何"。
+# 这样就把多维问题降维成了 "一维 (Univariate)" 问题。
+port_history_returns = df_clean @ weights 
+
+# 拟合参数
+# scipy.stats.t.fit 使用极大似然估计 (MLE)
+# 返回: df (自由度), loc (均值), scale (标准差)
+# 我们最关心 df (nu)，它决定了尾巴有多肥。
+nu, loc, scale = stats.t.fit(port_history_returns)
+
+print(f"\n拟合出的 t-分布自由度 (nu): {nu:.2f}")
+if nu < 5:
+    print("  -> 警告: 尾部极肥 (Fat Tails)，正态分布将严重低估风险！")
+elif nu > 30:
+    print("  -> 提示: 接近正态分布。")
+
+
+# ==========================================
+# 2. 计算修正后的乘数 (The Adjusted Multiplier)
+# ==========================================
+
+# 第一步：查 t-分布表 (Raw t-score)
+# 查找 t 分布下的 alpha 分位数 (比如 5%)
+t_score = stats.t.ppf(alpha, nu)
+
+# 第二步：方差调整 (Variance Adjustment) --- 容易被遗漏！
+# 逻辑：标准 t-分布的方差是 nu/(nu-2)，总是大于 1 的。
+# 我们之前算的 port_std 是基于协方差矩阵的 "真实波动率"。
+# 为了不重复计算波动率，我们需要把 t-分布 "缩放" 回单位方差。
+if nu > 2:
+    adj_factor = np.sqrt((nu - 2) / nu)
+else:
+    adj_factor = 1 # 极端情况 (nu<=2 意味着方差无穷大，理论崩塌)
+
+# 最终乘数
+final_multiplier = t_score * adj_factor
+
+# ==========================================
+# 3. 计算 t-VaR (Final Calculation)
+# ==========================================
+VaR_t_dist_percentage = - final_multiplier * port_std  # 这是一个正数，表示损失的百分比
+# 公式: VaR = - PV * (调整后的乘数) * 组合波动率
+VaR_t_dist = - PV * final_multiplier * port_std
+
+print(f"\n================ t分布的参数法VaR结果 ================")
+print(f"one-day t-Student VaR in percentage (95%): {VaR_t_dist_percentage:.2%}")
+print(f"one-day t-Student VaR (95%): ${VaR_t_dist:,.2f}")
+
+
+
+### 历史模拟法的 VaR (Historical Simulation VaR)，这里我们直接用历史数据计算组合的每日盈亏，然后根据置信水平取分位数计算 VaR 金额
+import numpy as np
+
+# ==========================================
+# 0. 准备工作
+# ==========================================
+# df_clean: 你的历史收益率数据 (N行 x M列)
+# weights:  你今天的持仓权重 (M列)
+# PV:       本金 (比如 1,000,000)
+# alpha:    0.05 (95% 置信度)
+
+# ==========================================
+# 1. 构造组合的历史收益率 (Construct Portfolio History)
+# ==========================================
+# 利用矩阵乘法，瞬间算出每一天的组合收益率
+# 这一步就是 "Re-valuation"
+print(df_clean.head())  # 查看前几行，确认数据格式正确
+weights = [1/4, 1/4, 1/4, 1/4]  # 确保权重是 numpy array 或 list，长度与 df_clean 列数一致
+port_hist_returns = df_clean @ weights
+
+# ==========================================
+# 2. 排序与找位 (Sort and Cut)
+# ==========================================
+# 方法 A: 手动排序法 (最符合 PPT 原理)
+sorted_returns = np.sort(port_hist_returns) # 从小到大排
+index_cutoff = int(len(sorted_returns) * alpha) # 算出第 5% 是第几个 (比如第25个)
+VaR_return = sorted_returns[index_cutoff] # 取出那个数
+
+# 方法 B: 自动分位法 (工程常用，结果更精确，自带插值)
+# percentle(5) 自动帮你完成排序和找位置
+VaR_return_auto = np.percentile(port_hist_returns, alpha * 100) 
+
+# ==========================================
+# 3. 算出最终金额
+# ==========================================
+# VaR 通常表示为正数 (Loss Amount)
+VaR_dollar = -VaR_return_auto * PV 
+
+print(f"/n历史模拟法 VaR (95%): ${VaR_dollar:,.2f}")
+print(f"对应收益率: {VaR_return_auto:.4%}")
+
+
+
+### 加权历史模拟法的 VaR (Weighted Historical Simulation VaR)，这里我们给历史数据中的每一天赋予一个权重，通常是指数衰减权重，然后根据加权的历史盈亏计算 VaR 金额
+import numpy as np
+import pandas as pd
+
+# ==========================================
+# 0. 参数准备
+# ==========================================
+# lambda_param: 衰减因子 (0.98 是业界标准)
+lambda_param = 0.98
+alpha = 0.05 # 95% VaR
+weights = np.array([1/4, 1/4, 1/4, 1/4]) # 资产持仓权重
+
+# 1. 穿越回过去 (Re-valuation) - 和基础版一样
+# 得到每一天的组合收益率
+historical_returns = df_clean @ weights
+
+# ==========================================
+# 2. 计算时间权重 (Time Weights) - 复杂版核心
+# ==========================================
+n_days = len(historical_returns)
+
+# 生成一个从 0 到 n-1 的序列
+# 假设 index 0 是最久远的数据，index -1 是昨天
+# 我们需要反过来，让昨天 (newest) 的权重最大
+time_decay = np.array([lambda_param**(n_days - 1 - i) for i in range(n_days)])
+
+# 归一化：保证权重之和为 1
+# time_weights 里的数越往后(越新)越大
+time_weights = time_decay / np.sum(time_decay)
+
+# ==========================================
+# 3. 排序并绑定权重 (Sort Returns & Weights)
+# ==========================================
+# 这里用 pandas DataFrame 处理会最方便，因为排序时权重必须跟着收益率一起动
+df_sim = pd.DataFrame({
+    'returns': historical_returns,
+    'weights': time_weights
+})
+
+# 按收益率从小到大排序 (最惨的亏损排在最前面)
+df_sorted = df_sim.sort_values(by='returns', ascending=True)
+
+# ==========================================
+# 4. 累加权重找 5% (Cumulative Sum)
+# ==========================================
+# 计算累积权重
+df_sorted['cum_weights'] = df_sorted['weights'].cumsum()
+
+# 找到第一个累积权重超过 5% (alpha) 的位置
+# 这个位置对应的收益率就是 VaR
+var_row = df_sorted[df_sorted['cum_weights'] >= alpha].iloc[0]
+
+VaR_weighted_return = var_row['returns']
+VaR_weighted_dollar = -VaR_weighted_return * PV
+
+print(f"--- Weighted Historical Simulation (Lambda={lambda_param}) ---")
+print(f"Weighted VaR (95%): ${VaR_weighted_dollar:,.2f}")
+print(f"Weighted VaR (%):   {-VaR_weighted_return:.4%}")
+
+
+
+### Hull-White (Volatility-Weighted Historical Simulation)，这里我们根据每一天的历史波动率来调整那一天的权重，波动率越大，权重越大，然后根据加权的历史盈亏计算 VaR 金额
+import numpy as np
+import pandas as pd
+
+# ==========================================
+# 0. 准备数据
+# ==========================================
+# 假设 port_history_returns 是一个 Pandas Series
+# 包含了过去 500 天组合的每日收益率
+# port_history_returns = df_clean @ weights 
+
+# 参数设置
+lambda_param = 0.94  # RiskMetrics 标准衰减因子
+alpha = 0.05         # 95% VaR
+
+# ==========================================
+# 1. 计算历史波动率序列 (Sigma_t)
+# ==========================================
+# 我们使用 EWMA (指数加权移动平均) 来估计每一天的波动率
+# pandas 的 ewm().std() 可以直接算出来
+# adjust=False 是为了匹配 RiskMetrics 的递归逻辑
+vol_series = port_history_returns.ewm(alpha=(1 - lambda_param), adjust=False).std()
+
+# 获取 "今天" (最新一天) 的波动率
+current_vol = vol_series.iloc[-1]
+
+print(f"当前波动率 (Current Vol): {current_vol:.4%}")
+
+# ==========================================
+# 2. 核心步骤：缩放历史收益率 (Scaling)
+# ==========================================
+# 公式: R_adj = R_t * (Current_Vol / Vol_t)
+# 这一步把过去所有的收益率都 "标准化" 到今天的波动率水平了
+scaling_factors = current_vol / vol_series
+adjusted_returns = port_history_returns * scaling_factors
+
+# [数据清洗] 去除前几天因为 EWMA 预热可能产生的 NaN
+adjusted_returns = adjusted_returns.dropna()
+
+# ==========================================
+# 3. 排序并找 VaR (Sort & Cut)
+# ==========================================
+# 对 "调整后" 的收益率进行排序
+VaR_HW_percent = -np.percentile(adjusted_returns, alpha * 100)
+
+# 计算金额
+VaR_HW_dollar = VaR_HW_percent * PV
+
+print(f"--- Hull-White (Vol-Weighted) Results ---")
+print(f"HW VaR (95%) : ${VaR_HW_dollar:,.2f}")
+print(f"HW VaR (%)   : {VaR_HW_percent:.4%}")
+
+
+
 ### 构建T回归，用MLE方法估计回归参数
 import numpy as np
 import pandas as pd
@@ -805,3 +1264,6 @@ print(f"R-squared (R方): {model.rsquared:.6f} (因子解释了多少波动)")
 residual_std = np.std(model.resid)
 print(f"残差波动率 (Std): {residual_std:.6f} (假设正态分布)")
 
+
+
+### 计算Expected Shortfall (ES)，这里我们先假设收益率服从正态分布，根据 VaR 的 Z 分数和组合波动率计算 ES 金额
