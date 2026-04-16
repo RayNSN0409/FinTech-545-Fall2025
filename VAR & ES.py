@@ -8,6 +8,22 @@ file_path = r"C:\Users\RAYNSN\Desktop\QRM\FinTech-545-Fall2025\testfiles\data\te
 # index_col=0 将第一列作为索引 (通常是日期列)，如果没有索引列则设置为 None
 df = pd.read_csv(file_path, index_col=0)
 
+#  最纯粹的导入
+# df = pd.read_csv(file_path)
+# 此时，Pandas 会非常聪明地做两件事：
+# - 自动把第一行识别为列名 (Columns)，比如 'x1', 'A', 'B'。
+# - 自动在最左侧生成一套 0, 1, 2, 3... 的数字索引 (RangeIndex)。
+
+# 若此文件无表头！
+#df = pd.read_csv(file_path, header=None)
+
+# 提取为你需要的格式
+# 场景 A：如果你只需要其中一列去跑拟合
+#x_array = df['x1'].dropna()  # 直接变成纯净的一维 Numpy 数组
+
+# 场景 B：如果你有多列，想整体变成矩阵去做 Copula 或协方差
+#df_clean = df.dropna() # 变成 N行 x M列 的二维数组
+
 # 3. 打印查看
 print(df.head())
 
@@ -117,6 +133,53 @@ for col in jb_results.columns:
         print(f"[{col}]: 拒绝正态假设 -> 建议使用 T分布 (MLE) 或 历史模拟法算 VaR。")
     else:
         print(f"[{col}]: 符合正态假设 -> 可以直接使用正态分布公式算 VaR。")
+
+# 11. AIC/BIC
+import numpy as np
+import pandas as pd
+import scipy.stats as stats
+
+def get_ic(ll, k, n):
+    """极简计算器：传入对数似然度(ll), 参数个数(k), 样本量(n)，输出 AICc 和 BIC"""
+    aic = 2 * k - 2 * ll
+    aicc = aic + (2 * k * (k + 1)) / (n - k - 1) if n > k + 1 else np.nan
+    bic = k * np.log(n) - 2 * ll
+    return aicc, bic
+
+def select_best_dist(series):
+    x = series.dropna().values
+    n = len(x)
+    if n <= 4: return pd.Series(dtype=float) # 样本极度缺失的防呆保护
+    
+    # 1. 正态分布拟合 (k=2)
+    mu, std = stats.norm.fit(x)
+    ll_n = stats.norm.logpdf(x, mu, std).sum()
+    aicc_n, bic_n = get_ic(ll_n, 2, n)
+    
+    # 2. T分布拟合 (k=3)
+    df_t, loc_t, scale_t = stats.t.fit(x)
+    ll_t = stats.t.logpdf(x, df_t, loc_t, scale_t).sum()
+    aicc_t, bic_t = get_ic(ll_t, 3, n)
+    
+    # 3. 极简输出评判结果
+    return pd.Series({
+        'Norm_AICc': aicc_n,
+        'T_AICc': aicc_t,
+        'Norm_BIC': bic_n,
+        'T_BIC': bic_t,
+        'Winner(AICc)': 'Norm' if aicc_n < aicc_t else 'T'
+    })
+
+# 批量执行并格式化输出
+# 假设你的 DataFrame 叫 log_returns
+ic_results = log_returns.apply(select_best_dist).T
+
+# 优雅的控制台输出
+print("\n=== 模型选型结果 (Normal vs T-Dist) ===")
+print(ic_results.round(2)) # 全局保留两位小数，保持版面干净
+
+print("\n=== 最终风控结论 ===")
+print(ic_results['Winner(AICc)'].value_counts().to_string())
         
         
         
@@ -128,6 +191,14 @@ import numpy as np
 # --- 1. 批量拟合 T分布 (MLE) ---
 # 对每一列执行 fit，提取三个核心参数：自由度(Nu), 位置(Mu), 尺度(Scale)
 t_params = df.apply(lambda x: pd.Series(stats.t.fit(x.dropna()), index=['Nu', 'Mu', 'Scale'])).T
+
+# ==============================================================================
+# [已注释] 去均值化 (Demean) 的正确做法 
+# ⚠️ 警告：绝对不要用 floc=0 来强行锁死中心点，这会严重扭曲优化器算出的自由度！
+# 如果模型或作业要求去均值，请解开下方两行注释，在物理层面减去均值后再自由拟合：
+# ==============================================================================
+# df_demeaned = df - df.mean()
+# t_params = df_demeaned.apply(lambda x: pd.Series(stats.t.fit(x.dropna()), index=['Nu', 'Mu', 'Scale'])).T
 
 # --- 2. 计算 T分布的理论统计量 ---
 # 警告：T分布的方差不等于 Scale^2，而是被 Nu 放大了一倍； 和样本方差也不一样，因为样本方差是基于数据的，而这里我们是基于拟合的参数来计算理论方差
@@ -192,7 +263,7 @@ print("\n=== 相关系数矩阵 (Correlation) ===")
 print(corr_matrix)
 
 # Method 2: Pairwise 协方差计算
-# 关键区别：不要执行 dropna()
+# 关键区别：不要执行 dropna()!!!
 # ==========================================
 # Pandas 的 .cov() 只要不手动 dropna，
 # 它会自动寻找每一对 (Pair) 变量的共同非空数据进行计算
@@ -302,6 +373,48 @@ df_corr = pd.DataFrame(corr_matrix, index=df_clean.columns, columns=df_clean.col
 
 print(f"=== 基于批量加权逻辑的 EWMA 相关系数矩阵 (Lambda={lam}) ===")
 print(df_corr)
+
+
+
+### 检验该协方差矩阵是否正定
+import numpy as np
+
+def check_matrix_definiteness(matrix_df, matrix_name="Matrix", tol=1e-8):
+    """
+    输入: Pandas DataFrame 格式的协方差或相关系数矩阵
+    输出: 最小特征值，并判定其正定性
+    """
+    # 1. 提取底层纯数字矩阵 (剔除表头)
+    # 填充可能存在的 NaN (如果是 Pairwise 极度缺失可能导致协方差算不出来)
+    mat = matrix_df.fillna(0).to_numpy()
+    
+    # 2. 计算特征值 (极其重要：使用 eigvalsh 而不是 eigvals)
+    # 因为协方差/相关系数矩阵在数学上必定是"对称矩阵 (Symmetric Matrix)"
+    # eigvalsh 专门针对对称矩阵做了底层 C 语言优化，不仅速度快，而且保证算出来的特征值全是实数！
+    eigenvalues = np.linalg.eigvalsh(mat)
+    
+    # 3. 提取最小特征值
+    min_eig = np.min(eigenvalues)
+    
+    print(f"\n=== 检验 [{matrix_name}] 的正定性 ===")
+    print(f"最小特征值 (Min Eigenvalue): {min_eig:.8f}")
+    
+    # 4. 判断逻辑 (引入 tol 容差来对抗浮点数误差)
+    if min_eig > tol:
+        print("结论: 该矩阵是 【正定矩阵 (Positive Definite, PD)】。")
+        print("业务意义: 完美！矩阵满秩，可以直接投入 Cholesky 分解生成蒙特卡洛随机数。")
+    elif min_eig > -tol:
+        print("结论: 该矩阵是 【半正定矩阵 (Positive Semi-Definite, PSD)】。")
+        print("业务意义: 处于临界状态。说明你的资产里存在极度相似的标的（比如完全线性相关的两只股票），虽然数学上没崩溃，但略有冗余。")
+    else:
+        print("结论: 该矩阵是 【非正定矩阵 (Non-Definite, ND)】。")
+        print("业务意义: 🚨 危险！矩阵内部存在逻辑冲突。绝对不能直接用于风控模拟，必须先执行 Higham 算法 (近邻正定矩阵修复)！")
+        
+    return min_eig
+
+# 1. 检验 Pairwise 相关系数矩阵 
+check_matrix_definiteness(pairwise_corr_matrix, "Pairwise 相关系数矩阵 (含错位数据)")
+
 
 
 
@@ -567,6 +680,60 @@ except np.linalg.LinAlgError:
     print("\n❌ 修复失败: 矩阵依然非正定")
     
     
+
+# ==========================================
+# 主成分分析 (PCA) 解释方差评估模块
+# ==========================================
+import numpy as np
+import pandas as pd
+
+def analyze_pca_variance(matrix, matrix_name="Matrix"):
+    """
+    对协方差或相关系数矩阵进行主成分分析 (PCA)，
+    输出各主成分的特征值、方差解释比例及累计解释比例。
+    """
+    # 兼容 DataFrame 和纯 Numpy Array 输入
+    mat = matrix.values if isinstance(matrix, pd.DataFrame) else matrix
+        
+    # 1. 计算特征值 (使用 eigvalsh 保证对称矩阵提取实数)
+    eigenvalues = np.linalg.eigvalsh(mat)
+    
+    # 2. 倒序排列，让包含信息量最大的主成分 (PC1) 排在最前
+    ev = eigenvalues[::-1]
+    
+    # 3. 计算每个主成分的解释方差占比 (Variance Explained)
+    # 注意：如果有负特征值，这里算出来的比例也会有负数，这恰好是诊断非正定的标志
+    vexp = ev / np.sum(ev)
+    
+    # 4. 计算累计解释方差 (Cumulative Variance Explained)
+    csexp = np.round(np.cumsum(vexp), 3)
+    
+    # 5. 组装成 DataFrame 报表 (额外增加了 Eigenvalue 列，让底层数据一目了然)
+    pca_df = pd.DataFrame({
+        'PC': np.arange(1, len(ev) + 1),
+        'Eigenvalue': np.round(ev, 6),
+        'Explained': np.round(vexp, 6),
+        'Cumulative': csexp
+    })
+    
+    print(f"\n=== [{matrix_name}] 主成分分析 (PCA) 解释方差表 ===")
+    print(pca_df.to_string(index=False))
+    
+    return pca_df
+
+# ---------------------------------------------------------
+# 🚀 终极实战调用：见证 Higham 算法的奇迹
+# ---------------------------------------------------------
+
+# 1. 看看修复前的原始矩阵 (一定包含可怕的负特征值)
+# 假设你之前算出的带有 NA 错位的矩阵叫 pairwise_corr_matrix
+# analyze_pca_variance(pairwise_corr_matrix, matrix_name="修复前: Pairwise 原始矩阵")
+
+# 2. 看看 Higham 修复后的完美矩阵 
+# 预期结果：负特征值被彻底抹平(变成0)，前几个主成分的纯度变得极高！
+pca_results = analyze_pca_variance(psd_cov_matrix_Higham, matrix_name="修复后: Higham 正定矩阵")
+    
+    
    
 ### 对PSD/PD的协方差矩阵进行Cholesky分解，得到下三角矩阵 L
 import numpy as np
@@ -796,6 +963,88 @@ print(f"--- T-Student Monte Carlo Results (nu={nu}) ---")
 print(f"MC VaR (95%) : ${VaR_t_MC_dollar:,.2f}")
 print(f"MC VaR (%)   : {VaR_t_MC_percent:.4%}")
 
+
+
+### 计算简单参数法下各列的VaR
+import pandas as pd
+import numpy as np
+import scipy.stats as stats
+
+# ==========================================
+# 1. 交互式控制台：提问是否去均值
+# ==========================================
+print("-" * 50)
+user_choice = input("⚠️ 是否需要对数据进行去均值化 (Remove Mean)? (Y/N): ").strip().upper()
+demean_flag = True if user_choice == 'Y' else False
+print(f"当前设置: {'[去均值化: 开启 (Mu=0)]' if demean_flag else '[去均值化: 关闭 (保留原始均值)]'}")
+print("-" * 50)
+
+alpha = 0.05
+
+# ==========================================
+# 2. 核心计算引擎 (单列处理，自带局部 dropna)
+# ==========================================
+def calculate_risk_metrics(series, demean=False, a=0.05):
+    # 局部 dropna 提取一维数组
+    data = series.dropna().to_numpy()
+    
+    # 获取全局固定的 Z-score (如 5% 单侧，约为 -1.6449)
+    z_score = stats.norm.ppf(a)
+    
+# 去均值化逻辑
+    if demean:
+        # 1. 物理层面的去均值化
+        data = data - data.mean()
+        
+        # 2. 正态分布：算术均值必定为 0，直接锁死 0.0
+        mu_norm = 0.0
+        
+        # 3. T分布：🚨 绝对不要加 floc=0！
+        # 让优化器自由寻找极大似然的峰值 (它会算出极其微小的非零数，完美对齐 Julia)
+        nu, loc_t, scale_t = stats.t.fit(data) 
+        
+    else:
+        mu_norm = data.mean()
+        nu, loc_t, scale_t = stats.t.fit(data)
+        
+    std_norm = data.std(ddof=1)
+    
+    # --- 计算 分数与 VaR ---
+    # 1. 正态 VaR
+    var_normal = -(mu_norm + z_score * std_norm)
+    
+    # 2. T分布 VaR
+    t_score = stats.t.ppf(a, df=nu)
+    var_t = -(loc_t + t_score * scale_t)
+    
+    # 3. 比较逻辑：谁算出来的亏损金额更大 (更保守)
+    larger_var = "T-Dist" if var_t > var_normal else "Normal"
+    
+    return pd.Series({
+        'Normal_VaR': var_normal,
+        'T_VaR': var_t,
+        'Z_Score': z_score,
+        'T_Score': t_score,
+        'Larger_VaR': larger_var
+    })
+
+# ==========================================
+# 3. 批量执行并展示报表
+# ==========================================
+# 假设你的 DataFrame 叫 log_returns
+risk_report = log_returns.apply(calculate_risk_metrics, demean=demean_flag, a=alpha).T
+
+# 格式化打印：VaR 显示百分比，Score 显示4位小数，字符串保持原样
+format_dict = {
+    'Normal_VaR': '{:.4%}',
+    'T_VaR': '{:.4%}',
+    'Z_Score': '{:.4f}',
+    'T_Score': '{:.4f}',
+    'Larger_VaR': '{}'
+}
+
+print("\n=== 多资产风险测算报表 (Z-Score vs T-Score 对决) ===")
+print(risk_report.style.format(format_dict).to_string())
 
 
 
@@ -1267,3 +1516,613 @@ print(f"残差波动率 (Std): {residual_std:.6f} (假设正态分布)")
 
 
 ### 计算Expected Shortfall (ES)，这里我们先假设收益率服从正态分布，根据 VaR 的 Z 分数和组合波动率计算 ES 金额
+import pandas as pd
+import numpy as np
+from scipy.stats import norm
+
+# 1. 读取并清理数据 (去除缺失值)
+df = pd.read_csv(r"C:\Users\RAYNSN\Desktop\QRM\FinTech-545-Fall2025\testfiles\data\test7_1.csv")
+x = df['x1'].dropna().values
+
+# 2. 提取分布参数 (ddof=1 确保计算的是样本标准差)
+mu = np.mean(x)
+sigma = np.std(x, ddof=1)
+alpha = 0.05
+
+# 3. 正态分布计算核心
+z = norm.ppf(alpha)      # 5% 尾部的临界 Z-score (负数)
+pdf_z = norm.pdf(z)      # 该 Z-score 对应的概率密度高度
+
+# 4. 代入 Delta Normal ES 公式
+es_diff = sigma * pdf_z / alpha  # 风险敞口 (波动率惩罚项)
+es_abs = -mu + es_diff           # 绝对 ES (取负号转化为正数亏损比例)
+
+# 5. 格式化并导出结果
+out_df = pd.DataFrame({
+    'ES Absolute': [es_abs], 
+    'ES Diff from Mean': [es_diff]
+})
+
+print(out_df)
+
+### 若有多列资产，我们进行矩阵推导法
+import pandas as pd
+import numpy as np
+from scipy.stats import norm
+
+# 假设 df_clean 是你读取并 dropna() 后的真实数据
+# df_clean = pd.read_csv("your_data.csv").dropna()
+
+# 1. 自动监测资产数量 (获取 DataFrame 的列数)
+n = df_clean.shape[1] 
+
+# 2. 自动生成等权重数组 (如果有 5 列，就是 5 个 20%)
+weights = np.array([1/n] * n)  
+
+# 3. 提取均值向量和协方差矩阵
+mu_vec = df_clean.mean().values              
+cov_matrix = df_clean.cov().values           
+
+# 4. 矩阵相乘，计算整个投资组合的均值和波动率
+mu_port = weights.T @ mu_vec                 
+var_port = weights.T @ cov_matrix @ weights  
+sigma_port = np.sqrt(var_port)               
+
+# 5. 计算组合 ES
+alpha = 0.05
+z = norm.ppf(alpha)
+pdf_z = norm.pdf(z)
+
+es_diff_port = sigma_port * pdf_z / alpha
+es_abs_port = -mu_port + es_diff_port
+
+print(f"成功监测到 {n} 个资产，已按等权重计算组合风险：")
+print(f"Portfolio Volatility: {sigma_port:.4%}")
+print(f"Portfolio ES (Absolute): {es_abs_port:.4%}")
+
+
+### 若每列单独计算 ES，我们可以直接对每列进行循环处理
+import pandas as pd
+import numpy as np
+from scipy.stats import norm
+
+# 假设 df_clean 是包含多列数据的 DataFrame (比如 'AAPL', 'MSFT', 'SPY')
+# df_clean = pd.read_csv("your_data.csv").dropna()
+
+alpha = 0.05
+z = norm.ppf(alpha)
+pdf_z = norm.pdf(z)
+
+# 1. 自动计算每一列的均值和标准差 (返回 Series)
+mu_series = df_clean.mean()
+sigma_series = df_clean.std(ddof=1)
+
+# 2. 向量化运算！(Pandas 会自动遍历 Series 里的每一只股票代入公式)
+es_diff_series = sigma_series * pdf_z / alpha
+es_abs_series = -mu_series + es_diff_series
+
+# 3. 把所有结果拼装成一张漂亮的报表
+out_df_individual = pd.DataFrame({
+    'ES Absolute': es_abs_series,
+    'ES Diff from Mean': es_diff_series
+})
+
+print(out_df_individual)
+
+
+
+### 计算 T分布的 ES，首先我们需要拟合出 T分布的参数（自由度 nu 和尺度 sigma），然后根据 T分布的 PDF 和 CDF 计算 ES 金额
+import pandas as pd
+import numpy as np
+from scipy.stats import t
+
+# 1. 读取数据 (保留所有 NA，让子弹飞一会儿)
+df = pd.read_csv(r"C:\Users\RAYNSN\Desktop\QRM\FinTech-545-Fall2025\testfiles\data\test7_2.csv")
+
+# =================================================================
+# ⚠️ 去均值开关：如果要物理去均值，解开下面这行注释！
+# df = df - df.mean()
+# =================================================================
+
+alpha = 0.05
+results = {}
+
+# 2. 遍历数据集的每一列单独作战
+for col in df.columns:
+    # 🎯 核心修正：局部 dropna！只剔除当前资产的空值，绝不牵连无辜！
+    x = df[col].dropna().values
+    
+    # 防呆：如果这列全是空值，直接跳过
+    if len(x) == 0:
+        continue
+    
+    # 拟合 T 分布参数: 自由度 (df_t), 均值 (loc_t), 尺度 (scale_t)
+    df_t, loc_t, scale_t = t.fit(x)
+    
+    # 🚨 极值保护：T分布的 ES 仅在自由度 > 1 时存在数学解析解
+    if df_t <= 1.0:
+        results[col] = {'ES Absolute': np.nan, 'ES Diff from Mean': np.nan, 'Warning': 'Nu <= 1, ES Infinite'}
+        continue
+    
+    # 获取临界 t 值 (分位数) 和对应的概率密度
+    t_val = t.ppf(alpha, df_t)
+    pdf_t = t.pdf(t_val, df_t)
+    
+    # 完美的 T 分布 ES 闭式解公式
+    es_diff = scale_t * (pdf_t / alpha) * ((df_t + t_val**2) / (df_t - 1))
+    es_abs = -loc_t + es_diff
+    
+    # 将结果存入字典
+    results[col] = {
+        'ES Absolute': es_abs, 
+        'ES Diff from Mean': es_diff,
+        'Fitted Nu': df_t  # 加上自由度方便最终排错
+    }
+
+# 3. 生成优雅的 DataFrame 报表
+out_df = pd.DataFrame(results).T
+out_df.index.name = 'Asset'
+
+# 格式化输出，百分比显示更具实战感
+format_dict = {
+    'ES Absolute': '{:.4%}', 
+    'ES Diff from Mean': '{:.4%}',
+    'Fitted Nu': '{:.2f}'
+}
+
+print(f"=== {len(out_df)} 列资产的 T 分布 ES 测算报告 ===")
+print(out_df.style.format(format_dict, na_rep="N/A").to_string())
+
+
+
+### 若有多列资产，我们可以在拟合 T 分布时使用多元 T 分布
+import pandas as pd
+import numpy as np
+from scipy.stats import t
+
+# 1. 读取多列数据并清理
+df = pd.read_csv(r"C:\Users\RAYNSN\Desktop\QRM\FinTech-545-Fall2025\testfiles\data\test7_2.csv")
+df_clean = df.dropna()
+
+# 2. 自动监测列数，设定权重 (这里演示等权重)
+n = df_clean.shape[1]
+weights = np.array([1/n] * n)
+
+# ==========================================
+# 3. 【核心步骤】：多列融合成一列 (Pre-aggregation)
+# DataFrame 的 .dot() 会自动把每一天的各股票收益率按权重相加
+# 得到一个一维的 Pandas Series，代表你的 Portfolio 每天的真实涨跌幅
+# ==========================================
+portfolio_returns = df_clean.dot(weights)
+
+# 4. 对这个组合的总收益率拟合 T 分布参数
+df_t, loc_t, scale_t = t.fit(portfolio_returns)
+
+# 5. 代入 T 分布 ES 公式计算整体风险
+alpha = 0.05
+t_val = t.ppf(alpha, df_t)
+pdf_t = t.pdf(t_val, df_t)
+
+es_diff_port = scale_t * (pdf_t / alpha) * ((df_t + t_val**2) / (df_t - 1))
+es_abs_port = -loc_t + es_diff_port
+
+# 6. 输出结果
+out_df = pd.DataFrame({
+    'Portfolio ES Absolute': [es_abs_port], 
+    'Portfolio ES Diff': [es_diff_port],
+    'Fitted df (nu)': [df_t]  # 顺便看看整体组合的尾巴有多肥
+})
+
+print(f"成功计算 {n} 个资产组合的整体 T 分布 ES：")
+print(out_df)
+
+
+
+### T分布下用蒙特卡洛模拟法计算 ES，这里我们先拟合出每列资产的 T 分布参数，然后根据这些参数生成随机数矩阵，最后根据置信水平计算 ES 金额
+import pandas as pd
+import numpy as np
+from scipy.stats import t
+
+# ==========================================
+# 1. 读取并清理数据 (支持任意列数)
+# ==========================================
+file_path = r"C:\Users\RAYNSN\Desktop\QRM\FinTech-545-Fall2025\testfiles\data\test7_2.csv"
+df = pd.read_csv(file_path).dropna()
+
+# 蒙特卡洛全局参数
+np.random.seed(42)       # 固定随机种子，保证每次交作业数字一样
+n_simulations = 1_000_000  # 100万次模拟
+alpha = 0.05
+
+results = {}
+
+# ==========================================
+# 2. 遍历引擎：自动计算每一列的 MC ES
+# ==========================================
+for col in df.columns:
+    x = df[col].values
+    
+    # 拟合该资产的 T 分布参数
+    df_t, loc_t, scale_t = t.fit(x)
+    
+    # 生成 100 万次模拟路径
+    simulated_returns = t.rvs(df=df_t, loc=loc_t, scale=scale_t, size=n_simulations)
+    
+    # 找 VaR 临界点
+    var_sim = np.percentile(simulated_returns, alpha * 100)
+    
+    # 计算 ES (切掉左侧尾巴求均值，取负号变为亏损额度)
+    es_abs_sim = -np.mean(simulated_returns[simulated_returns <= var_sim])
+    
+    # 计算距离均值的风险敞口 (数学推导: loc_t - (-es_abs_sim) = es_abs_sim + loc_t)
+    es_diff_sim = es_abs_sim + loc_t
+    
+    # 记录结果
+    results[col] = {
+        'ES Absolute': es_abs_sim, 
+        'ES Diff from Mean': es_diff_sim
+    }
+
+# ==========================================
+# 3. 拼装报表与导出
+# ==========================================
+out_df = pd.DataFrame(results).T
+out_df.index.name = 'Asset'
+
+output_path = r"C:\Users\RAYNSN\Desktop\QRM\FinTech-545-Fall2025\Assignment Answers by Ruiwen HE\W5\testout_8.6.csv"
+out_df.to_csv(output_path)
+
+print(f"--- 成功对 {df.shape[1]} 个资产进行了各 100 万次的蒙特卡洛 ES 模拟 ---")
+print(out_df)
+
+
+
+### n列资产的 T分布蒙特卡洛 ES，这里我们先把 n 列资产每天的收益率按权重相加，得到一个组合的历史收益率序列，然后对这个组合的收益率拟合 T 分布参数，最后根据拟合的 T 分布参数生成随机数进行蒙特卡洛模拟，计算 ES 金额
+import pandas as pd
+import numpy as np
+from scipy.stats import t
+
+# ==========================================
+# 1. 加载数据并融合为 "一维组合收益率"
+# ==========================================
+file_path = r"C:\Users\RAYNSN\Desktop\QRM\FinTech-545-Fall2025\testfiles\data\test7_2.csv"
+df = pd.read_csv(file_path).dropna()
+
+# 自动获取资产数量，并设定权重 (此处假设等权重)
+n_assets = df.shape[1]
+weights = np.array([1/n_assets] * n_assets)
+
+# 【核心动作】：矩阵点乘，将多列资产转化为 1 列组合总收益
+portfolio_returns = df.dot(weights)
+
+# ==========================================
+# 2. 拟合总体的 T 分布参数
+# ==========================================
+df_t, loc_t, scale_t = t.fit(portfolio_returns)
+
+# ==========================================
+# 3. 蒙特卡洛引擎 (只为组合整体跑 100 万次模拟)
+# ==========================================
+np.random.seed(42)       
+n_simulations = 1_000_000  
+alpha = 0.05
+
+# 直接生成组合的模拟收益率路径
+simulated_port_returns = t.rvs(df=df_t, loc=loc_t, scale=scale_t, size=n_simulations)
+
+# ==========================================
+# 4. 计算组合的 VaR 和 ES
+# ==========================================
+# 找 VaR 临界点 (最差的 5% 分界线)
+var_sim = np.percentile(simulated_port_returns, alpha * 100)
+
+# 算 ES (跌穿 VaR 线的极寒数据的平均跌幅)
+es_abs_sim = -np.mean(simulated_port_returns[simulated_port_returns <= var_sim])
+
+# 算风险敞口 (剥离组合自身的预期收益)
+es_diff_sim = es_abs_sim + loc_t
+
+# ==========================================
+# 5. 拼装报表与导出
+# ==========================================
+out_df = pd.DataFrame({
+    'Portfolio ES Absolute': [es_abs_sim], 
+    'Portfolio ES Diff from Mean': [es_diff_sim],
+    'Portfolio Fitted Nu (df)': [df_t]  # 顺便看看你的组合尾巴有多肥
+})
+
+print(f"--- 成功融合 {n_assets} 列资产，总体蒙特卡洛 ES 模拟完成 ---")
+print(out_df)
+
+
+
+### Gaussian Copula VaR，这里我们先计算每列资产的边际分布参数（均值和标准差），然后根据这些参数把历史数据转化为标准正态分布下的概率值，接着计算这些概率值的相关系数矩阵，最后使用 Gaussian Copula 生成模拟数据并计算 VaR 金额
+import pandas as pd
+import numpy as np
+from scipy.stats import norm, t
+
+# ==========================================
+# [外挂模块] Higham 近邻正定矩阵修复算法
+# ==========================================
+def project_to_positive_semidefinite(matrix):
+    eigenvalues, eigenvectors = np.linalg.eigh(matrix)
+    eigenvalues = np.maximum(eigenvalues, 0)
+    return eigenvectors @ np.diag(eigenvalues) @ eigenvectors.T
+
+def compute_nearest_correlation_higham(target_correlation, tol=1e-9, max_iter=1000):
+    correction_matrix = np.zeros_like(target_correlation)
+    current_correlation = target_correlation.copy()
+    for _ in range(max_iter):
+        last_correlation = current_correlation.copy()
+        temp_matrix = last_correlation - correction_matrix
+        psd_projection = project_to_positive_semidefinite(temp_matrix)
+        correction_matrix = psd_projection - temp_matrix
+        
+        # 强制对角线为1
+        current_correlation = psd_projection.copy()
+        np.fill_diagonal(current_correlation, 1.0)
+        
+        if np.linalg.norm(current_correlation - last_correlation, 'fro') < tol:
+            break
+    return current_correlation
+
+# ==========================================
+# 1. 数据加载与资产信息提取
+# ==========================================
+# 请确保路径正确，如果是 problem 6，请替换成对应的文件路径
+portfolio = pd.read_csv(r"C:\Users\RAYNSN\Desktop\QRM\FinTech-545-Fall2025\testfiles\data\test9_1_portfolio.csv")
+returns = pd.read_csv(r"C:\Users\RAYNSN\Desktop\QRM\FinTech-545-Fall2025\testfiles\data\test9_1_returns.csv")
+
+info = {}
+total_val = 0
+for _, row in portfolio.iterrows():
+    stock = row['Stock']
+    val = row['Holding'] * row['Starting Price']
+    info[stock] = {'Value': val, 'Dist': row['Distribution']}
+    total_val += val
+
+stocks = list(returns.columns)
+
+# ==========================================
+# 2. 拟合边缘分布 & 转化为均匀分布 (CDF)
+# ==========================================
+fits = {}
+# 初始化空的 U 矩阵，确保全为 float 以兼容 NaN
+u_returns = pd.DataFrame(index=returns.index, columns=stocks, dtype=float)
+
+for stock in stocks:
+    dist_type = info[stock]['Dist']
+    
+    # 提取纯净数据及其精确的日期索引 (避开 Pandas 维度报错地雷)
+    valid_data = returns[stock].dropna()
+    ret = valid_data.values
+    valid_idx = valid_data.index 
+    
+    if dist_type == 'Normal':
+        mu, std = norm.fit(ret)
+        fits[stock] = {'mu': mu, 'std': std, 'type': 'Normal'}
+        # 使用 .loc 按日期精准填入
+        u_returns.loc[valid_idx, stock] = norm.cdf(ret, loc=mu, scale=std)
+        
+    elif dist_type == 'T':
+        # 自由拟合，不加 floc=0，允许捕捉微小偏移
+        df_t, loc_t, scale_t = t.fit(ret)
+        fits[stock] = {'df': df_t, 'loc': loc_t, 'scale': scale_t, 'type': 'T'}
+        u_returns.loc[valid_idx, stock] = t.cdf(ret, df=df_t, loc=loc_t, scale=scale_t)
+
+# ==========================================
+# 3. 提取 Copula 的纯粹相关性结构 & 强制正定修复
+# ==========================================
+# 1. 在均匀分布 U 上计算 Spearman 秩相关系数 (遇到 NA 会自动 Pairwise)
+corr_matrix_df = u_returns.corr(method='spearman')
+
+# 2. 调用 Higham 算法，强行修复可能的非正定问题 (穿上防弹衣)
+corr_matrix_safe = compute_nearest_correlation_higham(corr_matrix_df.values)
+
+# 3. 转回 DataFrame 供汇报展示
+corr_matrix_safe_df = pd.DataFrame(corr_matrix_safe, index=stocks, columns=stocks)
+
+print("\n=== Copula 中实际使用的相关系数矩阵 (Spearman Rank - 已过 Higham 修复) ===")
+print(corr_matrix_safe_df)
+print("-" * 65)
+
+# ==========================================
+# 4. 蒙特卡洛生成平行宇宙
+# ==========================================
+np.random.seed(42)  
+n_simulations = 1_000_000  
+
+# 动态生成均值向量
+mean_vector = np.zeros(len(stocks))
+
+# 生成服从我们修复后相关性结构的多元标准正态分布 Z
+z_sim = np.random.multivariate_normal(mean_vector, corr_matrix_safe, n_simulations)
+
+# 转回均匀分布 U
+u_sim = norm.cdf(z_sim)
+
+# ==========================================
+# 5. 逆映射还原真实收益率 (PPF)
+# ==========================================
+simulated_returns = {}
+for i, stock in enumerate(stocks):
+    dist_type = fits[stock]['type']
+    if dist_type == 'Normal':
+        simulated_returns[stock] = norm.ppf(u_sim[:, i], loc=fits[stock]['mu'], scale=fits[stock]['std'])
+    elif dist_type == 'T':
+        simulated_returns[stock] = t.ppf(u_sim[:, i], df=fits[stock]['df'], loc=fits[stock]['loc'], scale=fits[stock]['scale'])
+
+# ==========================================
+# 6. 计算盈亏 (PnL) 与 尾部风险 (VaR/ES)
+# ==========================================
+pnl_sim = pd.DataFrame(simulated_returns)
+
+# 将收益率转化为真金白银的盈亏 ($)
+for stock in stocks:
+    pnl_sim[stock] = pnl_sim[stock] * info[stock]['Value']
+
+# 每日投资组合总盈亏
+pnl_sim['Total'] = pnl_sim.sum(axis=1)
+
+results = []
+alpha = 0.05
+
+for col in stocks + ['Total']:
+    # PnL 变损益，亏钱为正数
+    loss = -pnl_sim[col].values 
+    
+    # 找到最惨的 5% 临界点 (VaR)
+    var = np.percentile(loss, (1 - alpha) * 100)
+    
+    # 计算跌穿 VaR 时的平均极端损失 (ES)
+    es = np.mean(loss[loss >= var])
+
+    # 获取底层资产的本金，用来算百分比占比
+    val = info[col]['Value'] if col in info else total_val
+    
+    results.append({
+        'Asset': col,
+        'VaR95_($)': var,
+        'ES95_($)': es,
+        'VaR95_(%)': var / val,
+        'ES95_(%)': es / val
+    })
+
+# ==========================================
+# 7. 打印并导出精美风控报表
+# ==========================================
+results_df = pd.DataFrame(results)
+
+# 设置金额与百分比的格式化样式
+format_dict = {
+    'VaR95_($)': '${:,.2f}',
+    'ES95_($)': '${:,.2f}',
+    'VaR95_(%)': '{:.4%}',
+    'ES95_(%)': '{:.4%}'
+}
+
+print("\n=== Gaussian Copula 蒙特卡洛风控终极报告 (1,000,000 次模拟) ===")
+print(results_df.style.format(format_dict).to_string())
+
+
+
+### 计算各列PV 注意第一列是否为日期
+import pandas as pd
+# 1. 读取价格数据 (以第一列日期为索引)
+file_path = "problem6.csv"
+prices_df = pd.read_csv(file_path, index_col=0)
+
+# 2. 获取最后一天的价格 (T时刻价格)
+# .iloc[-1] 能精准切出最后一行 (即 2025年9月7日 的收盘价)
+current_prices = prices_df.iloc[-1]
+
+# 3. 填入持仓量 (Shares)
+shares = 100
+
+# 4. 计算当前市值 (PV)
+# 对应元素相乘
+pv = current_prices * shares
+
+print("=== 最后一天的最新价格 (Price) ===")
+print(current_prices)
+
+print("\n=== 当前各资产独立市值 (PV) ===")
+print(pv)
+
+print(f"\n-> 总投资组合市值 (Total Portfolio Value): ${pv.sum():,.2f}")
+
+
+
+import numpy as np
+import pandas as pd
+from scipy.stats import norm, t
+
+# ==========================================
+# 0. 准备测试数据 (假设你有一列收益率数据)
+# ==========================================
+# 这里用随机生成的含有微小肥尾的数据作为演示，
+# 实际使用时替换为：data = df['Your_Asset'].dropna().values
+np.random.seed(42)
+data = np.random.standard_t(df=5, size=500) * 0.015 + 0.0005 
+
+PV = 1_000_000      # 持仓市值 100万美元
+n_sims = 100_000    # 模拟十万次
+alpha = 0.05        # 95% 置信水平
+
+# ==========================================
+# 1. 交互式风控控制台 (Interactive Prompts)
+# ==========================================
+print("=" * 60)
+print("🚀 欢迎使用单资产蒙特卡洛风控引擎 (MC VaR & ES)")
+print("=" * 60)
+
+ans_demean = input("⚠️ 是否需要对历史数据进行【去均值化】(Remove Mean)? (Y/N): ").strip().upper()
+demean_flag = True if ans_demean == 'Y' else False
+
+ans_dist = input("⚠️ 是否使用【T分布】刻画肥尾风险? (Y=T分布, N=正态分布): ").strip().upper()
+t_dist_flag = True if ans_dist == 'Y' else False
+
+print("\n" + "-" * 60)
+print(f"⚙️ 引擎配置: 去均值化=[{'开启' if demean_flag else '关闭'}], 底层分布=[{'T分布' if t_dist_flag else '正态分布'}]")
+print("-" * 60)
+
+# ==========================================
+# 2. 数据清洗与参数拟合 (Data Prep & Fitting)
+# ==========================================
+
+# A. 去均值处理 (物理平移法)
+if demean_flag:
+    data = data - data.mean()
+
+# B. 分布拟合与随机数生成 (核心引擎)
+if t_dist_flag:
+    # 拟合 T 分布 (牢记黄金法则：去均值后也不加 floc=0，让它自由寻找微小偏移)
+    df_t, loc_t, scale_t = t.fit(data)
+    
+    # 抽取 10万个 T分布 随机数
+    sim_asset_returns = t.rvs(df_t, loc=loc_t, scale=scale_t, size=n_sims)
+    
+    dist_info = f"T-Distribution (Nu={df_t:.2f}, Loc={loc_t:.6f}, Scale={scale_t:.4f})"
+else:
+    # 拟合正态分布
+    mu_norm, std_norm = norm.fit(data)
+    
+    # 抽取 10万个 正态分布 随机数
+    sim_asset_returns = np.random.normal(loc=mu_norm, scale=std_norm, size=n_sims)
+    
+    dist_info = f"Normal Distribution (Mu={mu_norm:.6f}, Std={std_norm:.4f})"
+
+# ==========================================
+# 3. 计算金额盈亏与尾部风险 (PnL & VaR/ES)
+# ==========================================
+
+# 转化为金额盈亏
+sim_port_pnl = PV * sim_asset_returns
+
+# 取出最惨的 5% 临界点 (加负号变为正的亏损金额)
+VaR_MC_percent = -np.percentile(sim_asset_returns, alpha * 100)
+VaR_MC_dollar = -np.percentile(sim_port_pnl, alpha * 100)
+
+# 切片：挑出所有跌破 VaR 的灾难日盈亏，算平均亏损 (ES)
+tail_losses_dollar = sim_port_pnl[sim_port_pnl <= -VaR_MC_dollar]
+ES_MC_dollar = -np.mean(tail_losses_dollar)
+
+# 计算 ES 的百分比
+ES_MC_percent = ES_MC_dollar / PV
+
+# ==========================================
+# 4. 打印终极风控报表
+# ==========================================
+print("\n" + "=" * 60)
+print(f"📊 蒙特卡洛模拟分析报告 (Simulations: {n_sims:,})")
+print("=" * 60)
+print(f"拟合模型 : {dist_info}")
+print(f"组合市值 : ${PV:,.2f}")
+print(f"置信水平 : {1 - alpha:.0%}")
+print("-" * 60)
+print(f"🔥 MC VaR (亏损金额) : ${VaR_MC_dollar:,.2f}")
+print(f"🔥 MC ES  (极端均损) : ${ES_MC_dollar:,.2f}")
+print("-" * 60)
+print(f"📉 MC VaR (收益率%)  : {VaR_MC_percent:.4%}")
+print(f"📉 MC ES  (收益率%)  : {ES_MC_percent:.4%}")
+print("=" * 60)
